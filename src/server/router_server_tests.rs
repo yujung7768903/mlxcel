@@ -1044,6 +1044,7 @@ async fn ui_operations_routes_list_get_and_report_cancel_unsupported() {
                 model_id: entry.ui_model_id.clone(),
                 requested_revision: Some(entry.lifecycle_revision()),
                 eviction_target_id: Some(eviction_entry.ui_model_id.clone()),
+                eviction_target_expected_revision: Some(eviction_entry.lifecycle_revision()),
             },
             Some("route-ops-0001"),
             "route:ops:1".to_string(),
@@ -1207,6 +1208,7 @@ async fn ui_model_action_route_validates_profile_fields_and_idempotency() {
         "action": "load",
         "expected_revision": entry.lifecycle_revision(),
         "idempotency_key": "profile-load-0001",
+        "eviction_target_expected_revision": entry.lifecycle_revision(),
         "load_profile": {
             "ctx_size": 8192,
             "n_parallel": 4,
@@ -1222,11 +1224,58 @@ async fn ui_model_action_route_validates_profile_fields_and_idempotency() {
         Some(ROUTER_KEY),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
-    assert_eq!(
-        response["error"]["field_errors"][0]["field"],
-        "load_profile"
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    contract::assert_operation_accepted(&response);
+}
+
+#[tokio::test]
+async fn ui_model_action_route_rejects_unsupported_load_profile_with_canonical_error() {
+    let root = temp_models_dir("ui-action-unsupported-profile");
+    add_fake_model(&root, "alpha");
+    let state = router_state_from(
+        RouterSources {
+            models_dir: Some(root),
+            cache: None,
+            presets: Default::default(),
+        },
+        keyed_config(),
+        true,
     );
+    let entry = state.pool.get("alpha").expect("entry");
+    let revision = entry.lifecycle_revision();
+    let app = create_router_app_with_authenticated_ui(state);
+    let body = serde_json::json!({"model_id": entry.ui_model_id, "action":"load", "expected_revision":revision, "idempotency_key":"unsupported-profile-0001", "load_profile":{"ctx_size":1}});
+    let (status, mut response) = send(
+        app,
+        Method::POST,
+        "/ui-api/v1/model-actions",
+        &body.to_string(),
+        Some(ROUTER_KEY),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert!(
+        response["request_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        response["error"]["operation_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    response["request_id"] = serde_json::json!("req_profile_invalid_example");
+    response["error"]["operation_id"] = serde_json::json!("op_profile_invalid_example");
+    let mut expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/webui/examples/error.load-profile-unsupported.json"
+    ))
+    .expect("fixture");
+    expected
+        .as_object_mut()
+        .expect("object")
+        .remove("$schemaName");
+    assert_eq!(response, expected);
+    assert_eq!(entry.lifecycle_revision(), revision);
 }
 
 #[tokio::test]
@@ -1299,9 +1348,41 @@ async fn ui_model_action_route_rejects_contract_invalid_fields() {
                 "action": "load",
                 "expected_revision": revision,
                 "idempotency_key": "valid-key-0003",
-                "eviction_target_id": "mdl_short"
+                "eviction_target_id": "mdl_short",
+                "eviction_target_expected_revision": revision
             }),
             "eviction_target_id",
+        ),
+        (
+            serde_json::json!({
+                "model_id": model_id.clone(),
+                "action": "load",
+                "expected_revision": revision,
+                "idempotency_key": "valid-key-0006",
+                "eviction_target_id": model_id.clone()
+            }),
+            "eviction_target_expected_revision",
+        ),
+        (
+            serde_json::json!({
+                "model_id": model_id.clone(),
+                "action": "load",
+                "expected_revision": revision,
+                "idempotency_key": "valid-key-0007",
+                "eviction_target_expected_revision": revision
+            }),
+            "eviction_target_expected_revision",
+        ),
+        (
+            serde_json::json!({
+                "model_id": model_id.clone(),
+                "action": "load",
+                "expected_revision": revision,
+                "idempotency_key": "valid-key-0008",
+                "eviction_target_id": model_id.clone(),
+                "eviction_target_expected_revision": 0
+            }),
+            "eviction_target_expected_revision",
         ),
         (
             serde_json::json!({

@@ -20,8 +20,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::server::router_lifecycle::{
-    FieldError, MeasuredValue, RuntimeSettingValue, RuntimeSettingsReport, RuntimeSnapshot,
-    SCHEMA_VERSION,
+    FieldError, RuntimeSettingValue, RuntimeSettingsReport, SCHEMA_VERSION,
 };
 use crate::server::{ServerConfig, ServerStartupConfig};
 
@@ -86,6 +85,7 @@ pub(crate) struct BootstrapResponse {
     pub actions: BTreeMap<&'static str, ActionAvailability>,
     pub roots: Vec<RootSummary>,
     pub limits: LimitSummary,
+    pub media_limits: MediaLimits,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,6 +142,35 @@ pub(crate) struct LimitSummary {
     pub measurements_max: u64,
 }
 
+/// Projection of the same resolved limits used at the inference media boundary.
+#[derive(Debug, Serialize)]
+pub(crate) struct MediaLimits {
+    pub max_images: usize,
+    pub max_image_bytes: usize,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_decoded_bytes: u64,
+    pub max_body_bytes: u64,
+}
+
+pub(crate) fn media_limits(
+    limits: crate::server::media::ImageInputLimits,
+    mode: WebUiServerMode,
+) -> MediaLimits {
+    let mut body_limit = crate::server::app::main_json_body_limit_bytes_for_limits(limits);
+    if mode != WebUiServerMode::SingleModel {
+        body_limit = body_limit.min(crate::server::router_server::DISPATCH_BODY_CAP);
+    }
+    MediaLimits {
+        max_images: limits.max_images_per_request,
+        max_image_bytes: limits.max_payload_bytes,
+        max_width: limits.max_width,
+        max_height: limits.max_height,
+        max_decoded_bytes: limits.max_decode_alloc_bytes,
+        max_body_bytes: body_limit as u64,
+    }
+}
+
 pub(crate) fn bootstrap_response(
     startup: &ServerStartupConfig,
     config: &ServerConfig,
@@ -195,6 +224,7 @@ pub(crate) fn bootstrap_response(
         actions,
         roots: root_summaries(startup, cache_available, mode),
         limits: limit_summary(),
+        media_limits: media_limits(crate::server::media::current_image_input_limits(), mode),
     }
 }
 
@@ -308,46 +338,7 @@ pub(crate) fn limit_summary() -> LimitSummary {
     }
 }
 
-pub(crate) fn runtime_snapshot(
-    server_instance_id: String,
-    model_id: String,
-    revision: u64,
-    snapshot_sequence: u64,
-    config: &ServerConfig,
-) -> RuntimeSnapshot {
-    let mut measurements = BTreeMap::new();
-    measurements.insert(
-        "gpu_utilization".to_string(),
-        MeasuredValue {
-            value: None,
-            unit: "percent".to_string(),
-            scope: "unknown".to_string(),
-            measured_at: None,
-            reason: Some("not measured by mlxcel".to_string()),
-        },
-    );
-    measurements.insert(
-        "ttft".to_string(),
-        MeasuredValue {
-            value: None,
-            unit: "ms".to_string(),
-            scope: "model".to_string(),
-            measured_at: None,
-            reason: Some("no request timing sample is available for this model".to_string()),
-        },
-    );
-    RuntimeSnapshot {
-        schema_version: SCHEMA_VERSION.to_string(),
-        server_instance_id,
-        model_id,
-        revision: revision.max(1),
-        snapshot_sequence,
-        measurements,
-        settings: settings_report(config),
-    }
-}
-
-fn settings_report(config: &ServerConfig) -> RuntimeSettingsReport {
+pub(super) fn settings_report(config: &ServerConfig) -> RuntimeSettingsReport {
     let mut effective = BTreeMap::new();
     effective.insert(
         "ctx_size".to_string(),

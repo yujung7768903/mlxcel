@@ -288,6 +288,20 @@ impl RouterModelEntry {
             .map(|app| app.router.clone())
     }
 
+    /// Observe a loaded provider without routing, admission, autoload or LRU touch.
+    #[cfg(feature = "webui")]
+    pub(crate) fn runtime_observation_state(&self, expected_revision: u64) -> Option<AppState> {
+        let guard = self.state.lock().ok()?;
+        if self.hidden || self.lifecycle_revision() != expected_revision {
+            return None;
+        }
+        let app = guard.app.as_ref()?;
+        app.state
+            .model_provider
+            .is_loaded()
+            .then(|| app.state.clone())
+    }
+
     pub fn lifecycle_snapshot(&self) -> LifecycleSnapshot {
         self.lifecycle.snapshot()
     }
@@ -392,6 +406,34 @@ pub struct RouterPool {
         Mutex<Option<LoadCurrentCheckBeforeReservationHook>>,
     #[cfg(test)]
     load_after_reservation_hook: Mutex<Option<LoadAfterReservationHook>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ModelActionEvictionTarget<'a> {
+    pub model_id: &'a str,
+    pub expected_revision: u64,
+}
+
+impl<'a> ModelActionEvictionTarget<'a> {
+    pub fn new(model_id: &'a str, expected_revision: u64) -> Self {
+        Self {
+            model_id,
+            expected_revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OwnedModelActionEvictionTarget {
+    model_id: String,
+    expected_revision: u64,
+}
+
+#[derive(Default)]
+struct ModelActionLoadOptions {
+    eviction_target: Option<OwnedModelActionEvictionTarget>,
+    #[cfg(feature = "webui")]
+    profile: Option<super::webui::load_profile::UiLoadProfile>,
 }
 
 /// Why a name failed to resolve, load, download, or be removed.
@@ -842,7 +884,14 @@ impl RouterPool {
             .ok()?
             .values()
             .find(|entry| !entry.hidden && entry.ui_model_id == model_id)
-            .map(|entry| entry.config.clone())
+            .map(|entry| {
+                entry
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.app.as_ref().map(|app| (*app.state.config).clone()))
+                    .unwrap_or_else(|| entry.config.clone())
+            })
     }
 
     fn has_case_alias_entry(&self, name: &str) -> bool {
@@ -1254,6 +1303,7 @@ impl RouterPool {
             eviction_target.as_ref(),
             allow_lru_eviction,
             expectation.as_ref(),
+            None,
         )
         .await
         .map(|outcome| outcome.entry)
@@ -1265,6 +1315,7 @@ impl RouterPool {
         eviction_target: Option<&EvictionTarget>,
         allow_lru_eviction: bool,
         expectation: Option<&LoadEntryExpectation>,
+        load_config: Option<super::config::ServerConfig>,
     ) -> Result<LoadStartOutcome, RouterPoolError> {
         let name = entry.name.clone();
         let _entry_permit = entry.lifecycle.operation_guard().await;
@@ -1304,8 +1355,12 @@ impl RouterPool {
         if self.models_max > 0 {
             let mut explicit_victim = eviction_target.cloned();
             while self.running_count() >= self.models_max {
+                let unloading_explicit_victim = explicit_victim.is_some();
                 let (victim, victim_expectation) = if let Some(target) = explicit_victim.take() {
-                    self.ensure_entry_is_current(&target.entry, Some(&target.expectation))?;
+                    self.ensure_entry_is_current(&target.entry, Some(&target.expectation))
+                        .map_err(|err| {
+                            retarget_router_error_field(err, "eviction_target_expected_revision")
+                        })?;
                     let victim = target.entry.clone();
                     if victim.name == entry.name {
                         return Err(RouterPoolError::Capacity(
@@ -1357,8 +1412,16 @@ impl RouterPool {
                     name,
                     self.models_max
                 );
-                self.unload_entry_arc_with_expected(victim.clone(), victim_expectation.as_ref())
-                    .await?;
+                let unload_result = self
+                    .unload_entry_arc_with_expected(victim.clone(), victim_expectation.as_ref())
+                    .await;
+                if unloading_explicit_victim {
+                    unload_result.map_err(|err| {
+                        retarget_router_error_field(err, "eviction_target_expected_revision")
+                    })?;
+                } else {
+                    unload_result?;
+                }
                 if let Some(report) = eviction_report.as_mut() {
                     report.displaced_model_id = Some(victim.ui_model_id.clone());
                     report.outcome = ModelEvictionOutcome::Displaced;
@@ -1384,7 +1447,10 @@ impl RouterPool {
         // an observable state; the tokenizer and chat-template reads are
         // still filesystem work, so they run on the blocking pool rather
         // than stalling the async runtime.
-        let (path, config) = (entry.path.clone(), entry.config.clone());
+        let (path, config) = (
+            entry.path.clone(),
+            load_config.unwrap_or_else(|| entry.config.clone()),
+        );
         let built = tokio::task::spawn_blocking(move || build_model_app(&path, config))
             .await
             .unwrap_or_else(|join_err| Err(anyhow::anyhow!(join_err.to_string())));
@@ -1630,22 +1696,134 @@ impl RouterPool {
         }
     }
 
+    /// Startup-pinned profile fields for the canonical runtime report. These
+    /// are captured once, not inferred from a running worker's changed values.
+    #[cfg(feature = "webui")]
+    pub(crate) fn next_load_cli_overrides(&self) -> Vec<String> {
+        [
+            ("ctx_size", self.cli_overrides.ctx_size),
+            ("n_parallel", self.cli_overrides.n_parallel),
+            ("kv_cache_mode", self.cli_overrides.kv_cache_mode),
+        ]
+        .into_iter()
+        .filter(|(_, pinned)| *pinned)
+        .map(|(name, _)| name.to_string())
+        .collect()
+    }
+
+    #[cfg(feature = "webui")]
+    fn resolve_entry_load_profile(
+        &self,
+        entry: &RouterModelEntry,
+        profile: &super::webui::load_profile::UiLoadProfile,
+    ) -> Result<super::config::ServerConfig, super::webui::load_profile::ProfileError> {
+        let mut startup = self.base_startup.clone();
+        startup.model_path = entry.path.clone();
+        let section = self.sources.presets.for_model(&entry.name);
+        super::router_presets::apply_section_to_startup(
+            &mut startup,
+            &section,
+            &self.cli_overrides,
+        );
+        profile.apply(&mut startup, &self.cli_overrides)?;
+        let mut config = super::startup::build_server_config(&startup, self.api_keys.clone());
+        config.model_alias = entry.config.model_alias.clone();
+        config.model_aliases = entry.config.model_aliases.clone();
+        Ok(config)
+    }
+
     pub fn submit_model_action(
         self: &Arc<Self>,
         model_id: &str,
         action: RouterModelAction,
         expected_revision: u64,
         idempotency_key: &str,
-        eviction_target_id: Option<&str>,
+        eviction_target: Option<ModelActionEvictionTarget<'_>>,
     ) -> Result<super::router_lifecycle::OperationAccepted, RouterPoolError> {
+        self.submit_model_action_options(
+            model_id,
+            action,
+            expected_revision,
+            idempotency_key,
+            ModelActionLoadOptions {
+                eviction_target: eviction_target.map(|target| OwnedModelActionEvictionTarget {
+                    model_id: target.model_id.to_string(),
+                    expected_revision: target.expected_revision,
+                }),
+                #[cfg(feature = "webui")]
+                profile: None,
+            },
+        )
+    }
+
+    #[cfg(feature = "webui")]
+    pub(crate) fn submit_model_action_with_profile(
+        self: &Arc<Self>,
+        model_id: &str,
+        action: RouterModelAction,
+        expected_revision: u64,
+        idempotency_key: &str,
+        eviction_target: Option<ModelActionEvictionTarget<'_>>,
+        profile: Option<super::webui::load_profile::UiLoadProfile>,
+    ) -> Result<super::router_lifecycle::OperationAccepted, RouterPoolError> {
+        self.submit_model_action_options(
+            model_id,
+            action,
+            expected_revision,
+            idempotency_key,
+            ModelActionLoadOptions {
+                eviction_target: eviction_target.map(|target| OwnedModelActionEvictionTarget {
+                    model_id: target.model_id.to_string(),
+                    expected_revision: target.expected_revision,
+                }),
+                profile: profile.filter(|profile| profile.has_overrides()),
+            },
+        )
+    }
+
+    fn submit_model_action_options(
+        self: &Arc<Self>,
+        model_id: &str,
+        action: RouterModelAction,
+        expected_revision: u64,
+        idempotency_key: &str,
+        options: ModelActionLoadOptions,
+    ) -> Result<super::router_lifecycle::OperationAccepted, RouterPoolError> {
+        let eviction_target_id = options
+            .eviction_target
+            .as_ref()
+            .map(|target| target.model_id.as_str());
+        let eviction_target_expected_revision = options
+            .eviction_target
+            .as_ref()
+            .map(|target| target.expected_revision);
+        if eviction_target_expected_revision == Some(0) {
+            return Err(RouterPoolError::OperationRejected(ErrorBody {
+                code: "invalid_request".to_string(),
+                message: "eviction target expected revision must be at least 1".to_string(),
+                retryable: false,
+                field_errors: Some(vec![super::router_lifecycle::FieldError {
+                    field: "eviction_target_expected_revision".to_string(),
+                    code: "out_of_range".to_string(),
+                    message: "eviction_target_expected_revision must be at least 1".to_string(),
+                }]),
+                operation_id: None,
+            }));
+        }
         let kind = match action {
             RouterModelAction::Load => OperationKind::ModelLoad,
             RouterModelAction::Unload => OperationKind::ModelUnload,
         };
         let fingerprint = format!(
-            "{kind:?}:{model_id}:{expected_revision}:{}",
-            eviction_target_id.unwrap_or("")
+            "{kind:?}:{model_id}:{expected_revision}:{}:{}",
+            eviction_target_id.unwrap_or(""),
+            eviction_target_expected_revision
+                .map(|revision| revision.to_string())
+                .unwrap_or_default()
         );
+        // Request identity includes the profile even when CLI precedence masks a value.
+        #[cfg(feature = "webui")]
+        let fingerprint = format!("{fingerprint}:{:?}", options.profile);
         let accepted = self
             .lifecycle
             .begin_operation(
@@ -1654,6 +1832,7 @@ impl RouterPool {
                     model_id: model_id.to_string(),
                     requested_revision: Some(expected_revision),
                     eviction_target_id: eviction_target_id.map(ToString::to_string),
+                    eviction_target_expected_revision,
                 },
                 Some(idempotency_key),
                 fingerprint,
@@ -1704,15 +1883,79 @@ impl RouterPool {
             });
         }
 
-        let eviction_target = match eviction_target_id {
-            Some(target_id) => match self.get_by_model_id(target_id) {
-                Some(target) => Some(EvictionTarget {
-                    expectation: LoadEntryExpectation {
+        #[cfg(feature = "webui")]
+        let load_config =
+            if let Some(profile) = options.profile.as_ref().filter(|p| p.has_overrides()) {
+                let resolved = (|| {
+                    if action != RouterModelAction::Load {
+                        return Err(super::webui::load_profile::ProfileError::unsupported(
+                            "load_profile",
+                            "profiles only apply to load actions",
+                        ));
+                    }
+                    self.resolve_entry_load_profile(&entry, profile)
+                })();
+                match resolved {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        let error = ErrorBody {
+                        code: "unsupported".to_string(),
+                        message:
+                            "next-load profile is invalid for this model or startup configuration"
+                                .to_string(),
+                        retryable: true,
+                        operation_id: Some(accepted.operation_id.clone()),
+                        field_errors: Some(vec![super::router_lifecycle::FieldError {
+                            field: error.field.to_string(),
+                            code: error.code.to_string(),
+                            message: error.message,
+                        }]),
+                    };
+                        self.lifecycle.update_operation(
+                            &accepted.operation_id,
+                            OperationState::Failed,
+                            None,
+                            Some(error.clone()),
+                        );
+                        return Err(RouterPoolError::OperationRejected(error));
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(not(feature = "webui"))]
+        let load_config = None;
+
+        let eviction_target = match options.eviction_target.as_ref() {
+            Some(requested_target) => match self.get_by_model_id(&requested_target.model_id) {
+                Some(target) => {
+                    let expectation = LoadEntryExpectation {
                         model_id: target.ui_model_id.clone(),
-                        revision: target.lifecycle.revision(),
-                    },
-                    entry: target,
-                }),
+                        revision: requested_target.expected_revision,
+                    };
+                    if let Err(err) = self.ensure_entry_is_current(&target, Some(&expectation)) {
+                        let error = retarget_field_error(
+                            operation_error_for_router_error(&err, accepted.operation_id.clone()),
+                            "eviction_target_expected_revision",
+                        );
+                        self.lifecycle.update_operation(
+                            &accepted.operation_id,
+                            OperationState::Failed,
+                            None,
+                            Some(error.clone()),
+                        );
+                        return Err(match err {
+                            RouterPoolError::OperationRejected(_) => {
+                                RouterPoolError::OperationRejected(error)
+                            }
+                            other => other,
+                        });
+                    }
+                    Some(EvictionTarget {
+                        expectation,
+                        entry: target,
+                    })
+                }
                 None => {
                     let error = ErrorBody {
                         code: "not_found".to_string(),
@@ -1729,7 +1972,7 @@ impl RouterPool {
                         None,
                         Some(error),
                     );
-                    return Err(RouterPoolError::NotFound(target_id.to_string()));
+                    return Err(RouterPoolError::NotFound(requested_target.model_id.clone()));
                 }
             },
             None => None,
@@ -1790,6 +2033,7 @@ impl RouterPool {
                             eviction_target.as_ref(),
                             false,
                             Some(&expectation),
+                            load_config,
                         )
                         .await
                     };
@@ -2050,6 +2294,24 @@ impl RouterPool {
             Err(err) => match err {},
         }
     }
+}
+
+fn retarget_router_error_field(err: RouterPoolError, field: &str) -> RouterPoolError {
+    match err {
+        RouterPoolError::OperationRejected(error) => {
+            RouterPoolError::OperationRejected(retarget_field_error(error, field))
+        }
+        other => other,
+    }
+}
+
+fn retarget_field_error(mut error: ErrorBody, field: &str) -> ErrorBody {
+    if let Some(field_errors) = error.field_errors.as_mut() {
+        for field_error in field_errors {
+            field_error.field = field.to_string();
+        }
+    }
+    error
 }
 
 fn stale_catalog_error(expected_revision: Option<u64>, current_revision: u64) -> ErrorBody {
@@ -2638,6 +2900,7 @@ impl RouterPool {
             model_id: model_id.to_string(),
             requested_revision: Some(expected_revision),
             eviction_target_id: None,
+            eviction_target_expected_revision: None,
         };
         let fingerprint = format!("model_removal:{model_id}:{expected_revision}");
         let accepted = self
@@ -3066,3 +3329,7 @@ mod router_models_discovery_tests;
 #[cfg(test)]
 #[path = "router_unload_revision_tests.rs"]
 mod router_unload_revision_tests;
+
+#[cfg(all(test, feature = "webui"))]
+#[path = "router_load_profile_tests.rs"]
+mod router_load_profile_tests;
